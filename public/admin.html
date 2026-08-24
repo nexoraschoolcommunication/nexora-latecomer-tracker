@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Latecomer Admin Dashboard</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+  :root {
+    --bg: #0b1220; --card: #131c2e; --border: #22304a;
+    --accent: #22c55e; --danger: #ef4444; --text: #e5e9f0; --muted: #8b9bb4;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 18px 28px; background: var(--card); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+  }
+  header h1 { font-size: 19px; margin: 0; }
+  .status-wrap { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #statusDot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); }
+  #statusDot.connected { background: var(--accent); }
+
+  .container { padding: 24px 28px; max-width: 1200px; margin: 0 auto; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 14px; margin-bottom: 22px; }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; }
+  .stat-card .num { font-size: 28px; font-weight: 700; }
+  .stat-card .label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  .panel {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 20px; margin-bottom: 22px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 14px; display: flex; align-items: center; gap: 8px; }
+
+  .upload-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  input[type="file"] {
+    color: var(--muted); font-size: 13px;
+  }
+  button {
+    background: var(--accent); color: #06210f; border: none; font-weight: 700;
+    padding: 10px 16px; border-radius: 9px; cursor: pointer; font-size: 13px;
+  }
+  button.secondary { background: #334155; color: var(--text); }
+  button.danger { background: var(--danger); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #uploadMsg { font-size: 13px; margin-top: 10px; color: var(--muted); }
+
+  .table-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .search-input {
+    background: #0b1220; border: 1px solid var(--border); color: var(--text);
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; min-width: 220px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  thead th {
+    text-align: left; color: var(--muted); font-weight: 600; font-size: 12px;
+    text-transform: uppercase; letter-spacing: .03em; padding: 10px 12px; border-bottom: 1px solid var(--border);
+  }
+  tbody td { padding: 12px; border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: rgba(255,255,255,0.02); }
+  tbody tr.new-row { animation: flash 1.4s ease-out; }
+  @keyframes flash { from { background: rgba(34,197,94,0.25); } to { background: transparent; } }
+  .badge { background: #0f2f21; color: var(--accent); padding: 3px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .empty-state { text-align: center; color: var(--muted); padding: 40px 0; font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🗂️ Latecomer Admin Dashboard</h1>
+  <div class="status-wrap"><span id="statusDot"></span><span id="statusText">Connecting...</span></div>
+</header>
+
+<div class="container">
+
+  <div class="stats">
+    <div class="stat-card"><div class="num" id="statTotal">0</div><div class="label">Latecomers Today</div></div>
+    <div class="stat-card"><div class="num" id="statStudents">0</div><div class="label">Students in Database</div></div>
+    <div class="stat-card"><div class="num" id="statLast">—</div><div class="label">Last Scan Time</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>📤 Master List Upload</h2>
+    <div class="upload-row">
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+      <button id="uploadBtn">Upload &amp; Process</button>
+    </div>
+    <div id="uploadMsg">Expected columns: Roll number, Student name, Class, Admission NO</div>
+  </div>
+
+  <div class="panel">
+    <div class="table-toolbar">
+      <h2 style="margin:0;">🕒 Today's Latecomers (Live)</h2>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input class="search-input" id="searchInput" placeholder="Search name / class..." />
+        <button class="secondary" id="exportBtn">Export CSV</button>
+        <button class="danger" id="clearBtn">Clear Today</button>
+      </div>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Student Name</th><th>Class</th><th>Roll No</th><th>Admission No</th><th>Scanned By</th></tr>
+      </thead>
+      <tbody id="scanTableBody"></tbody>
+    </table>
+    <div class="empty-state" id="emptyState" style="display:none;">No latecomers recorded yet today.</div>
+  </div>
+
+</div>
+
+<script>
+const socket = io();
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+socket.on('connect', () => { statusDot.classList.add('connected'); statusText.textContent = 'Live'; });
+socket.on('disconnect', () => { statusDot.classList.remove('connected'); statusText.textContent = 'Offline'; });
+
+let allScans = [];
+
+function fmtTime(iso) {
+  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function renderTable(filter = '') {
+  const tbody = document.getElementById('scanTableBody');
+  const emptyState = document.getElementById('emptyState');
+  const q = filter.trim().toLowerCase();
+  const rows = allScans.filter(s =>
+    !q || s.student_name.toLowerCase().includes(q) || String(s.class || '').toLowerCase().includes(q)
+  );
+
+  tbody.innerHTML = '';
+  emptyState.style.display = rows.length ? 'none' : 'block';
+
+  rows.forEach((s, idx) => {
+    const tr = document.createElement('tr');
+    if (idx === 0 && s._isNew) tr.classList.add('new-row');
+    tr.innerHTML = `
+      <td>${fmtTime(s.scanned_at)}</td>
+      <td><strong>${escapeHtml(s.student_name)}</strong></td>
+      <td><span class="badge">${escapeHtml(s.class || '—')}</span></td>
+      <td>${escapeHtml(s.roll_number || '—')}</td>
+      <td>${escapeHtml(s.admission_no)}</td>
+      <td>${escapeHtml(s.scanned_by || '—')}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+function updateStats() {
+  document.getElementById('statTotal').textContent = allScans.length;
+  document.getElementById('statLast').textContent = allScans.length ? fmtTime(allScans[0].scanned_at) : '—';
+}
+
+async function loadStudentCount() {
+  const res = await fetch('/api/students/count');
+  const data = await res.json();
+  document.getElementById('statStudents').textContent = data.totalStudents;
+}
+
+async function loadScans() {
+  const res = await fetch('/api/scans');
+  allScans = await res.json();
+  updateStats();
+  renderTable(document.getElementById('searchInput').value);
+}
+
+socket.on('new-scan', (record) => {
+  record._isNew = true;
+  allScans.unshift(record);
+  updateStats();
+  renderTable(document.getElementById('searchInput').value);
+  // simple audio-free flash notification via title blink
+  document.title = `🔴 New Latecomer — ${record.student_name}`;
+  setTimeout(() => document.title = 'Latecomer Admin Dashboard', 2000);
+});
+
+socket.on('scans-cleared', () => { loadScans(); });
+
+document.getElementById('searchInput').addEventListener('input', (e) => renderTable(e.target.value));
+
+document.getElementById('uploadBtn').addEventListener('click', async () => {
+  const fileInput = document.getElementById('fileInput');
+  const msg = document.getElementById('uploadMsg');
+  if (!fileInput.files.length) { msg.textContent = 'Please choose a file first.'; return; }
+
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  msg.textContent = 'Processing...';
+
+  try {
+    const res = await fetch('/api/upload-master', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (res.ok) {
+      msg.textContent = `✅ ${data.message}`;
+      loadStudentCount();
+    } else {
+      msg.textContent = `❌ ${data.error || 'Upload failed'}`;
+    }
+  } catch (e) {
+    msg.textContent = '❌ Network error during upload';
+  }
+});
+
+document.getElementById('exportBtn').addEventListener('click', () => {
+  window.open('/api/scans/export', '_blank');
+});
+
+document.getElementById('clearBtn').addEventListener('click', async () => {
+  if (!confirm('Clear all of today\'s latecomer records? This cannot be undone.')) return;
+  await fetch('/api/scans', { method: 'DELETE' });
+  loadScans();
+});
+
+// initial load + light polling fallback in case a socket event is ever missed
+loadScans();
+loadStudentCount();
+setInterval(loadScans, 30000);
+</script>
+</body>
+</html>
