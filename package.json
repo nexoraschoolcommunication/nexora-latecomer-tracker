@@ -1,0 +1,19 @@
+{
+  "name": "latecomer-scanning-system",
+  "version": "1.0.0",
+  "description": "Latecomer scanning system with Scanner and Admin web interfaces",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "multer": "^2.0.1",
+    "socket.io": "^4.7.5",
+    "xlsx": "^0.18.5"
+  }
+}
