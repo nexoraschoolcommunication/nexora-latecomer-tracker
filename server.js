@@ -118,10 +118,14 @@ app.post('/api/upload-master', upload.single('file'), async (req, res) => {
       });
     }
 
-    let imported = 0;
     let skipped = 0;
-
-    await client.query('BEGIN');
+    const admissionNos = [];
+    const rollNumbers = [];
+    const studentNames = [];
+    const classNames = [];
+    // De-dupe within the same sheet (last occurrence wins) so unnest() doesn't
+    // try to insert the same admission_no twice in one statement.
+    const seen = new Map();
 
     for (const r of rows) {
       const admissionNo = normalizeAdmissionNo(r[admissionKey]);
@@ -132,17 +136,32 @@ app.post('/api/upload-master', upload.single('file'), async (req, res) => {
       }
       const rollNumber = rollKey ? String(r[rollKey] || '').trim() : '';
       const className = classKey ? String(r[classKey] || '').trim() : '';
+      seen.set(admissionNo, { rollNumber, studentName, className });
+    }
 
+    for (const [admissionNo, s] of seen) {
+      admissionNos.push(admissionNo);
+      rollNumbers.push(s.rollNumber);
+      studentNames.push(s.studentName);
+      classNames.push(s.className);
+    }
+
+    const imported = admissionNos.length;
+
+    await client.query('BEGIN');
+
+    // Single batched statement (unnest) instead of one round-trip per row —
+    // avoids hitting the statement timeout on larger sheets.
+    if (imported > 0) {
       await client.query(
         `INSERT INTO students (admission_no, roll_number, student_name, class)
-         VALUES ($1, $2, $3, $4)
+         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
          ON CONFLICT (admission_no) DO UPDATE SET
            roll_number = EXCLUDED.roll_number,
            student_name = EXCLUDED.student_name,
            class = EXCLUDED.class`,
-        [admissionNo, rollNumber, studentName, className]
+        [admissionNos, rollNumbers, studentNames, classNames]
       );
-      imported++;
     }
 
     await client.query('COMMIT');
