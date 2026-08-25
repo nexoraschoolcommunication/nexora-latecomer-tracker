@@ -79,7 +79,7 @@
   <div class="stats">
     <div class="stat-card"><div class="num" id="statTotal">0</div><div class="label">Latecomers Today</div></div>
     <div class="stat-card"><div class="num" id="statStudents">0</div><div class="label">Students in Database</div></div>
-    <div class="stat-card"><div class="num" id="statLast">—</div><div class="label">Last Scan Time</div></div>
+    <div class="stat-card"><div class="num" id="statLast">—</div><div class="label">Last Scan Time (IST)</div></div>
   </div>
 
   <div class="panel">
@@ -102,7 +102,7 @@
     </div>
     <table>
       <thead>
-        <tr><th>Time</th><th>Student Name</th><th>Class</th><th>Roll No</th><th>Admission No</th><th>Scanned By</th></tr>
+        <tr><th>Time (IST)</th><th>Student Name</th><th>Class</th><th>Roll No</th><th>Admission No</th><th>Scanned By</th></tr>
       </thead>
       <tbody id="scanTableBody"></tbody>
     </table>
@@ -120,8 +120,11 @@ socket.on('disconnect', () => { statusDot.classList.remove('connected'); statusT
 
 let allScans = [];
 
+// Always render times in IST regardless of the viewer's own device timezone.
 function fmtTime(iso) {
-  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return new Date(iso).toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
 }
 
 function renderTable(filter = '') {
@@ -135,9 +138,9 @@ function renderTable(filter = '') {
   tbody.innerHTML = '';
   emptyState.style.display = rows.length ? 'none' : 'block';
 
-  rows.forEach((s, idx) => {
+  rows.forEach((s) => {
     const tr = document.createElement('tr');
-    if (idx === 0 && s._isNew) tr.classList.add('new-row');
+    if (s._isNew) tr.classList.add('new-row');
     tr.innerHTML = `
       <td>${fmtTime(s.scanned_at)}</td>
       <td><strong>${escapeHtml(s.student_name)}</strong></td>
@@ -156,7 +159,7 @@ function escapeHtml(str) {
 
 function updateStats() {
   document.getElementById('statTotal').textContent = allScans.length;
-  document.getElementById('statLast').textContent = allScans.length ? fmtTime(allScans[0].scanned_at) : '—';
+  document.getElementById('statLast').textContent = allScans.length ? fmtTime(allScans[allScans.length - 1].scanned_at) : '—';
 }
 
 async function loadStudentCount() {
@@ -166,7 +169,7 @@ async function loadStudentCount() {
 }
 
 async function loadScans() {
-  const res = await fetch('/api/scans');
+  const res = await fetch('/api/scans'); // server returns chronological (earliest first) order
   allScans = await res.json();
   updateStats();
   renderTable(document.getElementById('searchInput').value);
@@ -174,10 +177,10 @@ async function loadScans() {
 
 socket.on('new-scan', (record) => {
   record._isNew = true;
-  allScans.unshift(record);
+  // Append (not prepend) so the table stays in the same chronological order as the CSV export.
+  allScans.push(record);
   updateStats();
   renderTable(document.getElementById('searchInput').value);
-  // simple audio-free flash notification via title blink
   document.title = `🔴 New Latecomer — ${record.student_name}`;
   setTimeout(() => document.title = 'Latecomer Admin Dashboard', 2000);
 });
