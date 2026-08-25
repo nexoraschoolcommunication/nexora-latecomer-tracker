@@ -43,12 +43,20 @@
     padding: 8px 10px; border-radius: 8px; font-size: 14px;
   }
 
+  .mode-tabs {
+    display: flex; background: var(--card); border-top: 1px solid #334155;
+  }
+  .mode-tab {
+    flex: 1; text-align: center; padding: 10px; font-size: 13px; font-weight: 700;
+    color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  .mode-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
   #reader-wrap {
     position: relative; flex: 1; background: #000; overflow: hidden;
   }
   #reader { width: 100%; height: 100%; }
   #reader video { object-fit: cover; width: 100% !important; height: 100% !important; }
-  /* hide html5-qrcode's default UI clutter for a clean camera-only view */
   #reader img { display: none; }
   #reader__dashboard_section_csr { display: none !important; }
   #reader__scan_region { border: none !important; }
@@ -57,6 +65,24 @@
     position: absolute; bottom: 16px; left: 0; right: 0; text-align: center;
     color: #fff; font-size: 13px; text-shadow: 0 1px 3px rgba(0,0,0,0.8); pointer-events: none;
   }
+
+  /* ---------- Manual entry mode ---------- */
+  #manualWrap {
+    display: none; flex: 1; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px; gap: 16px; background: var(--bg);
+  }
+  #manualWrap.show { display: flex; }
+  #manualWrap .manual-label { color: var(--muted); font-size: 14px; text-align: center; }
+  #manualAdmissionInput {
+    width: 100%; max-width: 300px; background: var(--card); border: 1px solid #334155;
+    color: var(--text); font-size: 32px; text-align: center; letter-spacing: 6px;
+    padding: 18px; border-radius: 14px; font-weight: 700;
+  }
+  #manualLookupBtn {
+    width: 100%; max-width: 300px; background: var(--accent); color: #06210f; border: none;
+    padding: 16px; border-radius: 12px; font-size: 16px; font-weight: 700; cursor: pointer;
+  }
+  #manualLookupBtn:disabled { opacity: 0.5; }
 
   .overlay {
     position: fixed; inset: 0; background: rgba(15,23,42,0.92);
@@ -116,10 +142,21 @@
     <input id="teacherName" type="text" placeholder="Your name / Gate (e.g. Mr. Rao - Main Gate)" />
   </div>
 
+  <div class="mode-tabs">
+    <div class="mode-tab active" id="tabScan">📷 Scan Barcode</div>
+    <div class="mode-tab" id="tabManual">⌨️ Type Admission No</div>
+  </div>
+
   <div id="reader-wrap">
     <div id="reader"></div>
     <div class="error-banner" id="errorBanner"></div>
     <div class="scan-hint">Point camera at the barcode</div>
+  </div>
+
+  <div id="manualWrap">
+    <div class="manual-label">Enter the student's 4-digit Admission Number<br>(use this if they don't have their ID card)</div>
+    <input id="manualAdmissionInput" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="0000" autocomplete="off" />
+    <button id="manualLookupBtn">Look Up Student</button>
   </div>
 </div>
 
@@ -154,9 +191,15 @@ teacherNameInput.addEventListener('input', () => localStorage.setItem('teacherNa
 const overlay = document.getElementById('overlay');
 const toastEl = document.getElementById('toast');
 const errorBanner = document.getElementById('errorBanner');
+const readerWrap = document.getElementById('reader-wrap');
+const manualWrap = document.getElementById('manualWrap');
+const tabScan = document.getElementById('tabScan');
+const tabManual = document.getElementById('tabManual');
+const manualInput = document.getElementById('manualAdmissionInput');
+const manualBtn = document.getElementById('manualLookupBtn');
 
 let currentStudent = null;
-let isPaused = false; // pause scanning while a result is being shown/confirmed
+let isPaused = false;
 let lastCode = null;
 let lastCodeTime = 0;
 
@@ -176,21 +219,25 @@ function vibrate(ms) {
   if (navigator.vibrate) navigator.vibrate(ms);
 }
 
-async function onScanSuccess(decodedText) {
-  // Debounce: ignore identical code scanned again within 3s, and ignore while paused
-  const now = Date.now();
-  if (isPaused) return;
-  if (decodedText === lastCode && (now - lastCodeTime) < 3000) return;
-  lastCode = decodedText;
-  lastCodeTime = now;
+// ---------- Mode switching ----------
+tabScan.addEventListener('click', () => {
+  tabScan.classList.add('active');
+  tabManual.classList.remove('active');
+  readerWrap.style.display = '';
+  manualWrap.classList.remove('show');
+});
 
-  // Extract a 4-digit admission number from whatever the barcode contains
-  const digitsOnly = decodedText.replace(/\D/g, '');
-  const admissionNo = digitsOnly.slice(-4).padStart(4, '0');
+tabManual.addEventListener('click', () => {
+  tabManual.classList.add('active');
+  tabScan.classList.remove('active');
+  readerWrap.style.display = 'none';
+  manualWrap.classList.add('show');
+  manualInput.value = '';
+  manualInput.focus();
+});
 
-  isPaused = true;
-  vibrate(60);
-
+// ---------- Shared lookup logic (used by both camera scan and manual entry) ----------
+async function lookupAndShow(admissionNo) {
   try {
     const res = await fetch(`/api/student/${admissionNo}`);
     if (!res.ok) {
@@ -198,8 +245,7 @@ async function onScanSuccess(decodedText) {
       showError(err.error === 'Student not found'
         ? `No student found for code ${admissionNo}`
         : 'Lookup failed');
-      isPaused = false;
-      return;
+      return false;
     }
     const student = await res.json();
     currentStudent = student;
@@ -208,17 +254,51 @@ async function onScanSuccess(decodedText) {
     document.getElementById('sRoll').textContent = student.roll_number || '—';
     document.getElementById('sClass').textContent = student.class || '—';
     overlay.classList.add('show');
+    return true;
   } catch (e) {
     showError('Network error during lookup');
-    isPaused = false;
+    return false;
   }
+}
+
+manualBtn.addEventListener('click', async () => {
+  const digits = manualInput.value.replace(/\D/g, '');
+  if (!digits) { showError('Enter an admission number'); return; }
+  const admissionNo = digits.padStart(4, '0').slice(-4);
+  manualBtn.disabled = true;
+  await lookupAndShow(admissionNo);
+  manualBtn.disabled = false;
+});
+
+manualInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') manualBtn.click();
+});
+
+async function onScanSuccess(decodedText) {
+  const now = Date.now();
+  if (isPaused) return;
+  if (decodedText === lastCode && (now - lastCodeTime) < 3000) return;
+  lastCode = decodedText;
+  lastCodeTime = now;
+
+  const digitsOnly = decodedText.replace(/\D/g, '');
+  const admissionNo = digitsOnly.slice(-4).padStart(4, '0');
+
+  isPaused = true;
+  vibrate(60);
+
+  const ok = await lookupAndShow(admissionNo);
+  if (!ok) isPaused = false;
 }
 
 function closeOverlay() {
   overlay.classList.remove('show');
   currentStudent = null;
-  // small delay so the same barcode isn't instantly re-triggered
   setTimeout(() => { isPaused = false; }, 400);
+  if (tabManual.classList.contains('active')) {
+    manualInput.value = '';
+    manualInput.focus();
+  }
 }
 
 document.getElementById('cancelBtn').addEventListener('click', closeOverlay);
@@ -254,8 +334,6 @@ document.getElementById('verifyBtn').addEventListener('click', async () => {
 });
 
 // ---------- High-speed scanner setup ----------
-// Limiting formatsToSupport to common 1D barcode types (skip QR/PDF417 detection)
-// speeds up decoding significantly on mobile since fewer decoders run per frame.
 const formatsToSupport = [
   Html5QrcodeSupportedFormats.CODE_128,
   Html5QrcodeSupportedFormats.CODE_39,
@@ -263,33 +341,30 @@ const formatsToSupport = [
   Html5QrcodeSupportedFormats.EAN_8,
   Html5QrcodeSupportedFormats.UPC_A,
   Html5QrcodeSupportedFormats.UPC_E,
-  Html5QrcodeSupportedFormats.QR_CODE // keep QR too, in case codes are printed as QR
+  Html5QrcodeSupportedFormats.QR_CODE
 ];
 
 const html5QrCode = new Html5Qrcode("reader", {
   formatsToSupport,
   verbose: false,
-  useBarCodeDetectorIfSupported: true // uses native BarcodeDetector API when available = much faster
+  useBarCodeDetectorIfSupported: true
 });
 
 const config = {
-  fps: 20,                          // high frame rate for near-instant reads
-  qrbox: { width: 280, height: 160 }, // narrower box tuned for 1D barcodes = less to scan = faster
+  fps: 20,
+  qrbox: { width: 280, height: 160 },
   aspectRatio: 1.777778,
   disableFlip: false,
   experimentalFeatures: { useBarCodeDetectorIfSupported: true }
 };
 
-function onScanFailure() {
-  // called continuously while no code is found — intentionally silent for performance
-}
+function onScanFailure() {}
 
 Html5Qrcode.getCameras().then(cameras => {
   if (!cameras || !cameras.length) {
     showError('No camera found on this device');
     return;
   }
-  // Prefer the back/environment camera
   const backCam = cameras.find(c => /back|rear|environment/i.test(c.label)) || cameras[cameras.length - 1];
   html5QrCode.start(
     { facingMode: "environment" },
@@ -297,7 +372,6 @@ Html5Qrcode.getCameras().then(cameras => {
     onScanSuccess,
     onScanFailure
   ).catch(() => {
-    // fallback to explicit device id if facingMode constraint fails
     html5QrCode.start(backCam.id, config, onScanSuccess, onScanFailure)
       .catch(err => showError('Camera start failed: ' + err));
   });
@@ -305,7 +379,6 @@ Html5Qrcode.getCameras().then(cameras => {
   showError('Camera permission denied or unavailable');
 });
 
-// keep video crisp / reacquire focus on resume for mobile browsers
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     lastCode = null;
