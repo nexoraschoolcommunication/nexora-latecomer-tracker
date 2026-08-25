@@ -4,10 +4,11 @@ const path = require('path');
 const cors = require('cors');
 const multer = require('multer');
 const xlsx = require('xlsx');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3000;
+const TZ = 'Asia/Kolkata';
 
 // ---------- App / Server / Socket setup ----------
 const app = express();
@@ -18,34 +19,41 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ---------- Database ----------
-const fs = require('fs');
-const dataDir = path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-const db = new Database(path.join(dataDir, 'latecomer.db'));
-db.pragma('journal_mode = WAL');
+// ---------- Database (Postgres via DATABASE_URL env var) ----------
+if (!process.env.DATABASE_URL) {
+  console.error('Missing DATABASE_URL environment variable. Set it in Render > Environment.');
+  process.exit(1);
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS students (
-    admission_no   TEXT PRIMARY KEY,
-    roll_number    TEXT,
-    student_name   TEXT NOT NULL,
-    class          TEXT
-  );
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // required for Supabase/most hosted Postgres
+});
 
-  CREATE TABLE IF NOT EXISTS scans (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    admission_no   TEXT NOT NULL,
-    roll_number    TEXT,
-    student_name   TEXT NOT NULL,
-    class          TEXT,
-    scanned_by     TEXT,
-    scanned_at     TEXT NOT NULL,
-    scan_date      TEXT NOT NULL
-  );
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS students (
+      admission_no   TEXT PRIMARY KEY,
+      roll_number    TEXT,
+      student_name   TEXT NOT NULL,
+      class          TEXT
+    );
 
-  CREATE INDEX IF NOT EXISTS idx_scans_date ON scans(scan_date);
-`);
+    CREATE TABLE IF NOT EXISTS scans (
+      id             SERIAL PRIMARY KEY,
+      admission_no   TEXT NOT NULL,
+      roll_number    TEXT,
+      student_name   TEXT NOT NULL,
+      class          TEXT,
+      scanned_by     TEXT,
+      scanned_at     TEXT NOT NULL,
+      scan_date      TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_scans_date ON scans(scan_date);
+  `);
+  console.log('Database ready.');
+}
 
 // ---------- Multer (in-memory upload for the Excel master sheet) ----------
 const upload = multer({ storage: multer.memoryStorage() });
@@ -58,12 +66,26 @@ function normalizeAdmissionNo(value) {
   return digits.padStart(4, '0').slice(-4);
 }
 
+// "Today" in IST (school's actual local date), not UTC.
 function todayStr() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (server local via ISO/UTC)
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date());
+  const get = t => parts.find(p => p.type === t).value;
+  return `${get('year')}-${get('month')}-${get('day')}`; // YYYY-MM-DD
+}
+
+// Format an ISO timestamp as a readable IST time string, for CSV export.
+function formatIST(isoString) {
+  return new Date(isoString).toLocaleString('en-IN', {
+    timeZone: TZ, day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+  });
 }
 
 // ---------- API: Upload / process master Excel sheet ----------
-app.post('/api/upload-master', upload.single('file'), (req, res) => {
+app.post('/api/upload-master', upload.single('file'), async (req, res) => {
+  const client = await pool.connect();
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -74,8 +96,6 @@ app.post('/api/upload-master', upload.single('file'), (req, res) => {
 
     if (!rows.length) return res.status(400).json({ error: 'Sheet appears to be empty' });
 
-    // Flexible header matching (case/space insensitive) since Excel headers
-    // are exactly: Roll number, Student name, Class, Admission NO
     const findKey = (row, candidates) => {
       const keys = Object.keys(row);
       for (const cand of candidates) {
@@ -98,41 +118,37 @@ app.post('/api/upload-master', upload.single('file'), (req, res) => {
       });
     }
 
-    const insert = db.prepare(`
-      INSERT INTO students (admission_no, roll_number, student_name, class)
-      VALUES (@admission_no, @roll_number, @student_name, @class)
-      ON CONFLICT(admission_no) DO UPDATE SET
-        roll_number = excluded.roll_number,
-        student_name = excluded.student_name,
-        class = excluded.class
-    `);
-
     let imported = 0;
     let skipped = 0;
-    const skippedRows = [];
 
-    const insertMany = db.transaction((records) => {
-      for (const r of records) {
-        const admissionNo = normalizeAdmissionNo(r[admissionKey]);
-        const studentName = String(r[nameKey] || '').trim();
-        if (!admissionNo || !studentName) {
-          skipped++;
-          skippedRows.push(r);
-          continue;
-        }
-        insert.run({
-          admission_no: admissionNo,
-          roll_number: classKey ? String(r[rollKey] || '').trim() : String(r[rollKey] || '').trim(),
-          student_name: studentName,
-          class: classKey ? String(r[classKey] || '').trim() : ''
-        });
-        imported++;
+    await client.query('BEGIN');
+
+    for (const r of rows) {
+      const admissionNo = normalizeAdmissionNo(r[admissionKey]);
+      const studentName = String(r[nameKey] || '').trim();
+      if (!admissionNo || !studentName) {
+        skipped++;
+        continue;
       }
-    });
+      const rollNumber = rollKey ? String(r[rollKey] || '').trim() : '';
+      const className = classKey ? String(r[classKey] || '').trim() : '';
 
-    insertMany(rows);
+      await client.query(
+        `INSERT INTO students (admission_no, roll_number, student_name, class)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (admission_no) DO UPDATE SET
+           roll_number = EXCLUDED.roll_number,
+           student_name = EXCLUDED.student_name,
+           class = EXCLUDED.class`,
+        [admissionNo, rollNumber, studentName, className]
+      );
+      imported++;
+    }
 
-    const totalStudents = db.prepare('SELECT COUNT(*) AS c FROM students').get().c;
+    await client.query('COMMIT');
+
+    const { rows: countRows } = await pool.query('SELECT COUNT(*) AS c FROM students');
+    const totalStudents = parseInt(countRows[0].c, 10);
 
     res.json({
       success: true,
@@ -142,62 +158,81 @@ app.post('/api/upload-master', upload.single('file'), (req, res) => {
       message: `Imported/updated ${imported} students. ${skipped} rows skipped (missing name or admission no).`
     });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Upload error:', err);
     res.status(500).json({ error: 'Failed to process file', details: err.message });
+  } finally {
+    client.release();
   }
 });
 
-// ---------- API: current master-list status ----------
-app.get('/api/students/count', (req, res) => {
-  const row = db.prepare('SELECT COUNT(*) AS c FROM students').get();
-  res.json({ totalStudents: row.c });
-});
-
-app.get('/api/students', (req, res) => {
-  const rows = db.prepare('SELECT * FROM students ORDER BY class, roll_number').all();
-  res.json(rows);
-});
-
-// ---------- API: instant lookup by admission number (used by scanner) ----------
-app.get('/api/student/:admissionNo', (req, res) => {
-  const admissionNo = normalizeAdmissionNo(req.params.admissionNo);
-  if (!admissionNo) return res.status(400).json({ error: 'Invalid admission number' });
-
-  const student = db.prepare('SELECT * FROM students WHERE admission_no = ?').get(admissionNo);
-  if (!student) {
-    return res.status(404).json({ error: 'Student not found', admission_no: admissionNo });
+app.get('/api/students/count', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*) AS c FROM students');
+    res.json({ totalStudents: parseInt(rows[0].c, 10) });
+  } catch (err) {
+    console.error('Count error:', err);
+    res.status(500).json({ error: 'Failed to get count' });
   }
-  res.json(student);
 });
 
-// ---------- API: record a verified scan (teacher clicked "Verified") ----------
-app.post('/api/verify', (req, res) => {
+app.get('/api/students', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM students ORDER BY class, roll_number');
+    res.json(rows);
+  } catch (err) {
+    console.error('Students fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch students' });
+  }
+});
+
+app.get('/api/student/:admissionNo', async (req, res) => {
+  try {
+    const admissionNo = normalizeAdmissionNo(req.params.admissionNo);
+    if (!admissionNo) return res.status(400).json({ error: 'Invalid admission number' });
+
+    const { rows } = await pool.query('SELECT * FROM students WHERE admission_no = $1', [admissionNo]);
+    const student = rows[0];
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found', admission_no: admissionNo });
+    }
+    res.json(student);
+  } catch (err) {
+    console.error('Lookup error:', err);
+    res.status(500).json({ error: 'Lookup failed' });
+  }
+});
+
+app.post('/api/verify', async (req, res) => {
   try {
     const { admission_no, scanned_by } = req.body;
     const admissionNo = normalizeAdmissionNo(admission_no);
     if (!admissionNo) return res.status(400).json({ error: 'admission_no is required' });
 
-    const student = db.prepare('SELECT * FROM students WHERE admission_no = ?').get(admissionNo);
+    const { rows: studentRows } = await pool.query('SELECT * FROM students WHERE admission_no = $1', [admissionNo]);
+    const student = studentRows[0];
     if (!student) return res.status(404).json({ error: 'Student not found' });
 
     const now = new Date();
     const scanned_at = now.toISOString();
 
-    const info = db.prepare(`
-      INSERT INTO scans (admission_no, roll_number, student_name, class, scanned_by, scanned_at, scan_date)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      student.admission_no,
-      student.roll_number,
-      student.student_name,
-      student.class,
-      scanned_by || 'Unknown',
-      scanned_at,
-      todayStr()
+    const { rows: insertRows } = await pool.query(
+      `INSERT INTO scans (admission_no, roll_number, student_name, class, scanned_by, scanned_at, scan_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        student.admission_no,
+        student.roll_number,
+        student.student_name,
+        student.class,
+        scanned_by || 'Unknown',
+        scanned_at,
+        todayStr()
+      ]
     );
 
     const record = {
-      id: info.lastInsertRowid,
+      id: insertRows[0].id,
       admission_no: student.admission_no,
       roll_number: student.roll_number,
       student_name: student.student_name,
@@ -206,7 +241,6 @@ app.post('/api/verify', (req, res) => {
       scanned_at
     };
 
-    // Push instantly to every connected Admin dashboard
     io.emit('new-scan', record);
 
     res.json({ success: true, record });
@@ -216,50 +250,68 @@ app.post('/api/verify', (req, res) => {
   }
 });
 
-// ---------- API: fetch today's scans (Admin dashboard initial load) ----------
-app.get('/api/scans', (req, res) => {
-  const date = req.query.date || todayStr();
-  const rows = db.prepare('SELECT * FROM scans WHERE scan_date = ? ORDER BY id DESC').all(date);
-  res.json(rows);
+// Chronological order (earliest first) so Admin table and CSV export always match.
+app.get('/api/scans', async (req, res) => {
+  try {
+    const date = req.query.date || todayStr();
+    const { rows } = await pool.query('SELECT * FROM scans WHERE scan_date = $1 ORDER BY scanned_at ASC', [date]);
+    res.json(rows);
+  } catch (err) {
+    console.error('Scans fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch scans' });
+  }
 });
 
-// ---------- API: clear today's scans (start of a new day) ----------
-app.delete('/api/scans', (req, res) => {
-  const date = req.query.date || todayStr();
-  const info = db.prepare('DELETE FROM scans WHERE scan_date = ?').run(date);
-  io.emit('scans-cleared', { date });
-  res.json({ success: true, deleted: info.changes });
+app.delete('/api/scans', async (req, res) => {
+  try {
+    const date = req.query.date || todayStr();
+    const result = await pool.query('DELETE FROM scans WHERE scan_date = $1', [date]);
+    io.emit('scans-cleared', { date });
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (err) {
+    console.error('Clear error:', err);
+    res.status(500).json({ error: 'Failed to clear scans' });
+  }
 });
 
-// ---------- API: CSV export of today's (or a given date's) scans ----------
-app.get('/api/scans/export', (req, res) => {
-  const date = req.query.date || todayStr();
-  const rows = db.prepare('SELECT * FROM scans WHERE scan_date = ? ORDER BY scanned_at ASC').all(date);
+app.get('/api/scans/export', async (req, res) => {
+  try {
+    const date = req.query.date || todayStr();
+    const { rows } = await pool.query('SELECT * FROM scans WHERE scan_date = $1 ORDER BY scanned_at ASC', [date]);
 
-  const header = 'Roll Number,Student Name,Class,Admission No,Scanned By,Time\n';
-  const body = rows.map(r => {
-    const time = new Date(r.scanned_at).toLocaleString();
-    return [r.roll_number, r.student_name, r.class, r.admission_no, r.scanned_by, time]
-      .map(v => `"${String(v || '').replace(/"/g, '""')}"`)
-      .join(',');
-  }).join('\n');
+    const header = 'Roll Number,Student Name,Class,Admission No,Scanned By,Time (IST)\n';
+    const body = rows.map(r => {
+      const time = formatIST(r.scanned_at);
+      return [r.roll_number, r.student_name, r.class, r.admission_no, r.scanned_by, time]
+        .map(v => `"${String(v || '').replace(/"/g, '""')}"`)
+        .join(',');
+    }).join('\n');
 
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="latecomers-${date}.csv"`);
-  res.send(header + body);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="latecomers-${date}.csv"`);
+    res.send(header + body);
+  } catch (err) {
+    console.error('Export error:', err);
+    res.status(500).json({ error: 'Failed to export' });
+  }
 });
 
-// ---------- Socket.IO connection log ----------
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
   socket.on('disconnect', () => console.log('Client disconnected:', socket.id));
 });
 
-// ---------- Page routes ----------
 app.get('/', (req, res) => res.redirect('/scanner.html'));
 
-server.listen(PORT, () => {
-  console.log(`\n Latecomer Scanning System running on http://localhost:${PORT}`);
-  console.log(`   Scanner:  http://localhost:${PORT}/scanner.html`);
-  console.log(`   Admin:    http://localhost:${PORT}/admin.html\n`);
-});
+initDb()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`\n Latecomer Scanning System running on http://localhost:${PORT}`);
+      console.log(`   Scanner:  http://localhost:${PORT}/scanner.html`);
+      console.log(`   Admin:    http://localhost:${PORT}/admin.html\n`);
+    });
+  })
+  .catch(err => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
